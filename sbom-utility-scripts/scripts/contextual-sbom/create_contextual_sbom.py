@@ -1,8 +1,18 @@
 import json
 import subprocess
 from argparse import Namespace, ArgumentParser
+from enum import Enum
 from pathlib import Path
 from typing import Any
+
+PARENT_SBOM_LOCATION = Path("/shared") / "sbom-used-parent-image.json"
+
+
+class SBOMFormat(Enum):
+    """Enum for SBOM formats."""
+
+    SPDX2X = "SPDX 2.X"
+    CYCLONEDX1X = "CycloneDX 1.X"
 
 
 def parse_args() -> Namespace:
@@ -137,6 +147,60 @@ def get_parent_image(
     return _get_base_image_for_target(parsed_dockerfile, target_stage)
 
 
+def download_parent_image_sbom(pullspec: str | None, arch: str, save_path: Path = PARENT_SBOM_LOCATION) -> None:
+    """
+    Downloads parent pullspec.
+    Args:
+        pullspec:
+            Which image to download.
+        arch:
+            Architecture of the target system. Will be the same as the current runtime arch.
+        save_path:
+            Optional argument, specifies where to save the image SBOM.
+    Returns:
+        `None`
+    """
+    raise NotImplementedError("This will be implemented in ISV-5705.")
+
+
+def _get_sbom_format(sbom_dict: dict[str, Any]) -> SBOMFormat:
+    """
+    Determine SBOM format.
+    Args:
+        sbom_dict:
+            Dictionary containing the whole SBOM.
+    Returns:
+
+    """
+    if spdx_version := sbom_dict.get("spdxVersion"):
+        if spdx_version.startswith("SPDX-2"):
+            return SBOMFormat.SPDX2X
+    elif sbom_dict.get("bomFormat") == "CycloneDX" and (spec_version := sbom_dict.get("specVersion")):
+        if spec_version.startswith("1."):
+            return SBOMFormat.CYCLONEDX1X
+    raise ValueError("Unsupported SBOM format!")
+
+
+def use_contextual_sbom_creation(parent_image_sbom_path: Path) -> bool:
+    """
+    Based on the SBOM file of a parent image,
+    determine if the contextual SBOM mechanism should be used.
+
+    Args:
+        parent_image_sbom_path:
+            Location of the downloaded SBOM file in `pathlib.Path` format.
+    Returns:
+        `True` if contextual SBOM mechanism should be used. `False` otherwise.
+    """
+    if not parent_image_sbom_path.exists():
+        return False
+    parent_image_sbom = load_json(parent_image_sbom_path)
+    parent_image_sbom_format = _get_sbom_format(parent_image_sbom)
+    if parent_image_sbom_format is SBOMFormat.SPDX2X:
+        return True
+    return False
+
+
 def main():
     """
     Main function.
@@ -152,7 +216,9 @@ def main():
 
     parent_image = get_parent_image(parsed_dockerfile, target_stage, base_images)
     print(parent_image)
-    # TODO continue with other tasks
+    # TODO ISV-5705
+    # download_parent_image_sbom(parent_image)
+    print(f"Will the contextual mechanism be used? {use_contextual_sbom_creation(PARENT_SBOM_LOCATION)}")
 
 
 if __name__ == "__main__":
