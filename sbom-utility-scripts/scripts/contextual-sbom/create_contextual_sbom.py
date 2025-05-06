@@ -1,11 +1,27 @@
 import json
+import logging
 import subprocess
+import sys
 from argparse import Namespace, ArgumentParser
 from enum import Enum
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
-PARENT_SBOM_LOCATION = Path("/shared") / "sbom-used-parent-image.json"
+SBOM_DOC = dict[str, Any]
+
+LOGGER = logging.getLogger(__name__)
+
+# The `uname -m` and cosign each use different naming conventions
+# for cpu arches. This table translates from uname format to cosign one
+# reference: https://stackoverflow.com/questions/45125516/possible-values-for-uname-m
+# Also cosign expects format `kernel/arch`, so don't forget to add 'linux/' prefix
+ARCH_TRANSLATION = {
+    "amd64": {"x86_64", "x64"},
+    "arm64": {"arm", "aarch64_be", "aarch64", "armv8b", "armv8l"},
+    "ppc64le": {"powerpc", "ppc", "ppc64", "ppcle"},
+    "s390x": {"s390"},
+}
 
 
 class SBOMFormat(Enum):
@@ -13,6 +29,19 @@ class SBOMFormat(Enum):
 
     SPDX2X = "SPDX 2.X"
     CYCLONEDX1X = "CycloneDX 1.X"
+
+
+def setup_logger():
+    """
+    Set up logger to produce debug information to STDOUT.
+
+    Returns:
+        None
+    """
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.DEBUG)
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.DEBUG)
 
 
 def parse_args() -> Namespace:
@@ -32,16 +61,20 @@ def parse_args() -> Namespace:
 
 def identify_arch() -> str:
     """
-    Fetches the runtime arch. Requires uname command in the system/container.
+    Fetches the runtime arch. Requires `uname` command in the system/container.
 
     Returns:
-        String output of the `/bin/uname -m` command.
+        Cosign-compatible arch identifier.
     """
     res = subprocess.run(["/bin/uname", "-m"], capture_output=True)
-    return res.stdout.decode().strip()
+    raw_arch = res.stdout.decode().strip()
+    for cosign_arch, uname_arch_options in ARCH_TRANSLATION.items():
+        if raw_arch in uname_arch_options:
+            return f"linux/{cosign_arch}"
+    return f"linux/{raw_arch}"
 
 
-def load_json(path: Path) -> dict[str, Any]:
+def load_json(path: Path) -> SBOM_DOC:
     """
     Utility to load a dictionary from a json file.
 
@@ -89,7 +122,7 @@ def get_base_images(parsed_dockerfile: dict[str, Any]) -> list[str | None]:
 
 def _get_base_image_for_target(parsed_dockerfile: dict[str, Any], target_stage: str) -> str | None:
     """
-    Fetches the image referenced by a stage. Resolves transitive references to previous stages.
+    Fetches the image pullspec referenced by a stage. Resolves transitive references to previous stages.
 
     Args:
         parsed_dockerfile:
@@ -118,7 +151,7 @@ def _get_base_image_for_target(parsed_dockerfile: dict[str, Any], target_stage: 
     return last_ref
 
 
-def get_parent_image(
+def get_parent_image_pullspec(
     parsed_dockerfile: dict[str, Any],
     target_stage: str | None = None,
     base_images: list[str | None] | None = None,
@@ -147,23 +180,38 @@ def get_parent_image(
     return _get_base_image_for_target(parsed_dockerfile, target_stage)
 
 
-def download_parent_image_sbom(pullspec: str | None, arch: str, save_path: Path = PARENT_SBOM_LOCATION) -> None:
+def download_parent_image_sbom(pullspec: str | None, arch: str) -> SBOM_DOC | None:
     """
-    Downloads parent pullspec.
+    Downloads parent pullspec. First tries to download arch-specific SBOM, then image index
+    as a fallback.
     Args:
         pullspec:
             Which image to download.
         arch:
             Architecture of the target system. Will be the same as the current runtime arch.
-        save_path:
-            Optional argument, specifies where to save the image SBOM.
     Returns:
-        `None`
+        The found SBOM or `None`.
     """
-    raise NotImplementedError("This will be implemented in ISV-5705.")
+    if not pullspec:
+        LOGGER.debug("No parent image found.")
+        return None
+    cmd_result = subprocess.run(
+        ["/usr/bin/cosign", "download", "sbom", f"--platform={arch}", pullspec], capture_output=True
+    )
+    if "specified reference is not a multiarch image" in cmd_result.stderr.decode():
+        LOGGER.debug("Not a multiarch image, trying without version...")
+        cmd_result = subprocess.run(["/usr/bin/cosign", "download", "sbom", pullspec], capture_output=True)
+    if not cmd_result.stdout:
+        LOGGER.debug("Could not locate SBOM.")
+        return None
+    try:
+        return json.loads(cmd_result.stdout)
+    except JSONDecodeError:
+        LOGGER.warning(f"Invalid SBOM found, cannot parse JSON for pullspec '{pullspec}'.")
+        return None
 
 
-def _get_sbom_format(sbom_dict: dict[str, Any]) -> SBOMFormat:
+def _get_sbom_format(sbom_dict: SBOM_DOC) -> SBOMFormat:
     """
     Determine SBOM format.
     Args:
@@ -181,23 +229,25 @@ def _get_sbom_format(sbom_dict: dict[str, Any]) -> SBOMFormat:
     raise ValueError("Unsupported SBOM format!")
 
 
-def use_contextual_sbom_creation(parent_image_sbom_path: Path) -> bool:
+def use_contextual_sbom_creation(sbom_doc: SBOM_DOC | None) -> bool:
     """
     Based on the SBOM file of a parent image,
     determine if the contextual SBOM mechanism should be used.
 
     Args:
-        parent_image_sbom_path:
-            Location of the downloaded SBOM file in `pathlib.Path` format.
+        sbom_doc:
+            Loaded SBOM doc or `None`.
     Returns:
         `True` if contextual SBOM mechanism should be used. `False` otherwise.
     """
-    if not parent_image_sbom_path.exists():
+    if not sbom_doc:
+        LOGGER.debug("Contextual mechanism won't be used, there is no parent image SBOM.")
         return False
-    parent_image_sbom = load_json(parent_image_sbom_path)
-    parent_image_sbom_format = _get_sbom_format(parent_image_sbom)
+    parent_image_sbom_format = _get_sbom_format(sbom_doc)
     if parent_image_sbom_format is SBOMFormat.SPDX2X:
+        LOGGER.debug("Contextual mechanism will be used.")
         return True
+    LOGGER.debug("Contextual mechanism won't be used, parent SBOM is in CycloneDX format.")
     return False
 
 
@@ -208,17 +258,18 @@ def main():
     Returns:
         `None`
     """
+    setup_logger()
     args = parse_args()
     parsed_dockerfile = load_json(args.parsed_dockerfile)
     target_stage = args.target_stage
     # This may be reused in the future
     base_images = get_base_images(parsed_dockerfile)
 
-    parent_image = get_parent_image(parsed_dockerfile, target_stage, base_images)
-    print(parent_image)
-    # TODO ISV-5705
-    # download_parent_image_sbom(parent_image)
-    print(f"Will the contextual mechanism be used? {use_contextual_sbom_creation(PARENT_SBOM_LOCATION)}")
+    parent_image = get_parent_image_pullspec(parsed_dockerfile, target_stage, base_images)
+    arch = identify_arch()
+    sbom = download_parent_image_sbom(parent_image, arch)
+    use_contextual = use_contextual_sbom_creation(sbom)
+    print(use_contextual)  # Remove this print after this value has a use case
 
 
 if __name__ == "__main__":
